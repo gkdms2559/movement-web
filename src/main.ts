@@ -1,6 +1,7 @@
 import './style.css'
 import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision'
 import { createClient } from '@supabase/supabase-js'
+import patchworkAtlasUrl from './assets/original-patchwork-blue-atlas.png'
 
 type Work = {
   id: string
@@ -11,6 +12,9 @@ type Work = {
   y: number
   size: number
   description: string
+  exampleUrl?: string
+  previewUrl?: string
+  transitionLayout?: 'flip-grid'
 }
 
 type WorkState = Work & {
@@ -38,7 +42,9 @@ const supabasePublishableKey = (
 const supabase = supabaseUrl && supabasePublishableKey ? createClient(supabaseUrl, supabasePublishableKey) : null
 
 const works: Work[] = [
-  { id: 'R-389', name: 'Opening Hours', type: 'Hand Tracking', cls: 'orb-1', x: 35, y: 0, size: 150, description: 'A responsive study of the hand as it opens and closes a digital threshold.' },
+  { id: 'R-389', name: 'Awakening Spring', type: 'Hand Tracking', cls: 'orb-1', x: 35, y: 0, size: 150, description: 'Pinch a watering can, pour water over your reflection, and grow a garden of pixel flowers.', exampleUrl: 'examples/watering.html', previewUrl: `${import.meta.env.BASE_URL}watering-start-blue-purple-grid-v4.png` },
+  { id: 'R-112', name: 'The Mirror Board', type: 'Hand Tracking', cls: 'orb-10', x: 18, y: 275, size: 104, description: 'Sweep across a seamless camera grid and spin each panel into a shifting field of colour.', exampleUrl: 'examples/kitty-flip.html', previewUrl: patchworkAtlasUrl, transitionLayout: 'flip-grid' },
+  { id: 'R-808', name: 'Words in Motion', type: 'Hand Tracking', cls: 'orb-11', x: 82, y: 58, size: 112, description: 'Pause your hand to leave a word behind, then pinch to rearrange the sentence in space.', exampleUrl: 'examples/words-in-motion.html' },
   { id: 'R-228', name: 'White Noise', type: 'Body Tracking', cls: 'orb-2', x: 57, y: 10, size: 100, description: 'A body-led image field that turns small shifts into a quiet, granular signal.' },
   { id: 'R-214', name: 'Orbit', type: 'Hand Tracking', cls: 'orb-3', x: 42, y: 140, size: 82, description: 'A constellation that gathers around the movement of fingertips.' },
   { id: 'R-901', name: 'Touch Study', type: 'Hand Tracking', cls: 'orb-4', x: 24, y: 130, size: 108, description: 'An intimate interface for tracing pressure, proximity, and touch.' },
@@ -63,8 +69,11 @@ app.innerHTML = `
       <span class="terminal-prefix">&gt;_</span><span class="terminal-text"></span><span class="terminal-cursor" aria-hidden="true">|</span>
     </aside>
     <button class="guestbook-nav-button" id="guestbookButton" type="button">방명록</button>
-    <div class="tracking-status" id="trackingStatus" aria-live="polite">Mouse mode</div>
-    <button class="hand-mode-button" id="handModeButton" type="button">핸드트레킹 모드</button>
+    <div class="tracking-status" id="trackingStatus" aria-live="polite">Mouse Mode</div>
+    <div class="mode-controls" role="group" aria-label="Interaction mode">
+      <button class="mode-button is-active" id="mouseModeButton" type="button" aria-pressed="true">Mouse Mode</button>
+      <button class="mode-button" id="handModeButton" type="button" aria-pressed="false">Hand Tracking Mode</button>
+    </div>
     <video class="camera-preview" id="cameraPreview" autoplay playsinline muted></video>
     <div class="hand-cursor" id="handCursor" aria-hidden="true"><span></span></div>
     <div class="menu-panel" id="menuPanel" aria-hidden="true">
@@ -122,15 +131,24 @@ const worksElement = document.querySelector<HTMLDivElement>('#works')!
 const pointer = { x: innerWidth / 2, y: innerHeight / 2, active: false }
 const states: WorkState[] = []
 let handActive = false
+let trackingMode: 'mouse' | 'hand' = 'mouse'
 let handLandmarker: HandLandmarker | null = null
+let handLandmarkerPromise: Promise<HandLandmarker> | null = null
 let cameraStream: MediaStream | null = null
 let handWasOpen = false
 let fistLocked = false
 let selectedState: WorkState | null = null
 let centerLockedState: WorkState | null = null
 let lastTrackingMessage = ''
+let dialogWork: Work | null = null
+let lastHandDetectionAt = 0
+let lastDetectedVideoTime = -1
+let pageTransitioning = false
+
+const trackingAssetBase = `${import.meta.env.BASE_URL}tracking`
 
 function openWork(work: Work): void {
+  dialogWork = work
   document.querySelector<HTMLHeadingElement>('#dialogTitle')!.textContent = `${work.id} — ${work.name}`
   document.querySelector<HTMLParagraphElement>('#dialogDescription')!.textContent = work.description
   toggleLayer(document.querySelector<HTMLElement>('#workDialog')!, true)
@@ -142,9 +160,13 @@ works.forEach((work) => {
   element.type = 'button'
   element.setAttribute('aria-label', `${work.id}, ${work.name}`)
   element.style.setProperty('--orb-size', `${work.size}px`)
+  if (work.previewUrl) element.style.setProperty('--orb-art', `url(${work.previewUrl})`)
   element.style.left = `${work.x}%`
   element.style.top = `${work.y}px`
-  element.innerHTML = `<span class="orb ${work.cls}"></span><span class="fragments" aria-hidden="true"></span><span class="label">${work.id} [${work.type}]</span>`
+  const label = work.exampleUrl
+    ? `<span class="label"><strong class="work-title">${work.name}</strong></span>`
+    : `<span class="label">${work.id} [${work.type}]</span>`
+  element.innerHTML = `<span class="orb ${work.cls}"></span><span class="fragments" aria-hidden="true"></span>${label}`
   const orb = element.querySelector<HTMLSpanElement>('.orb')!
   const fragments = element.querySelector<HTMLSpanElement>('.fragments')!
   for (let index = 0; index < 12; index += 1) {
@@ -173,6 +195,7 @@ window.addEventListener('pointermove', setPointer, { passive: true })
 window.addEventListener('pointerleave', () => { pointer.active = false })
 
 function animate(): void {
+  if (pageTransitioning) return
   const rect = worksElement.getBoundingClientRect()
   const scale = Math.min(innerWidth / 800, innerHeight / 650)
   if (pointer.active) {
@@ -195,8 +218,10 @@ function animate(): void {
     centerLockedState = null
   }
   const trackingMessage = centerLockedState
-    ? handActive ? 'Selected — keep your hand open, then make a fist' : 'Selected — click to burst'
-    : handActive ? 'Index finger = cursor · touch a centre to select' : 'Mouse mode'
+    ? trackingMode === 'hand' ? 'Selected — keep your hand open, then make a fist' : 'Selected — click to burst'
+    : trackingMode === 'hand'
+      ? handActive ? 'Index finger = cursor · touch a centre to select' : 'Hand Tracking Mode'
+      : 'Mouse Mode'
   if (trackingMessage !== lastTrackingMessage) {
     document.querySelector<HTMLDivElement>('#trackingStatus')!.textContent = trackingMessage
     lastTrackingMessage = trackingMessage
@@ -247,13 +272,13 @@ function animate(): void {
       item.dx += item.vx
       item.dy += item.vy
     }
-    const attraction = Math.min(1, Math.hypot(item.dx, item.dy) / 55)
     const focusScale = centerLockedState === item ? 1.18 : pointer.active && selectedState === item ? 1.1 : 1
     item.element.style.transform = `translate3d(calc(-50% + ${item.dx / Math.max(scale, 0.65)}px), ${item.dy / Math.max(scale, 0.65)}px, 0)`
     item.orb.style.setProperty('--scale', ((1 + influence * 0.13) * focusScale).toFixed(3))
     item.element.classList.toggle('is-selected', pointer.active && selectedState === item)
     item.element.classList.toggle('is-center-locked', centerLockedState === item)
-    item.element.style.filter = `blur(${Math.max(0, 0.9 - attraction * 0.9).toFixed(2)}px)`
+    // Keep the artwork and labels crisp even when the pointer is idle.
+    item.element.style.filter = 'blur(0)'
   })
   requestAnimationFrame(animate)
 }
@@ -269,6 +294,9 @@ const menuPanel = document.querySelector<HTMLElement>('#menuPanel')!
 const dialog = document.querySelector<HTMLElement>('#workDialog')!
 document.querySelector<HTMLButtonElement>('#closeMenu')!.addEventListener('click', () => toggleLayer(menuPanel, false))
 document.querySelector<HTMLButtonElement>('#closeDialog')!.addEventListener('click', () => toggleLayer(dialog, false))
+document.querySelector<HTMLButtonElement>('#dialogAction')!.addEventListener('click', () => {
+  if (dialogWork?.exampleUrl) window.location.assign(`${import.meta.env.BASE_URL}${dialogWork.exampleUrl}`)
+})
 document.querySelector<HTMLDivElement>('#veil')!.addEventListener('click', () => { toggleLayer(menuPanel, false); toggleLayer(dialog, false) })
 document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { toggleLayer(menuPanel, false); toggleLayer(dialog, false) } })
 
@@ -290,11 +318,157 @@ function isFist(landmarks: Point[]): boolean {
   return curled >= 3
 }
 
+function ensureLiquidTransitionFilter(): void {
+  if (document.querySelector('#liquid-transition-filter')) return
+
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+  svg.id = 'liquid-transition-filter'
+  svg.setAttribute('aria-hidden', 'true')
+  svg.innerHTML = `
+    <filter id="liquid-transition-warp" x="-12%" y="-12%" width="124%" height="124%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.012 0.018" numOctaves="2" seed="7" result="liquid-noise">
+        <animate attributeName="baseFrequency" values="0.012 0.018;0.019 0.01;0.011 0.017;0.009 0.014" dur="1.55s" fill="freeze" />
+      </feTurbulence>
+      <feDisplacementMap in="SourceGraphic" in2="liquid-noise" scale="20" xChannelSelector="R" yChannelSelector="B" result="liquid-shape">
+        <animate attributeName="scale" values="18;34;24;6" keyTimes="0;0.2;0.52;1" dur="1.55s" fill="freeze" />
+      </feDisplacementMap>
+      <feGaussianBlur in="liquid-shape" stdDeviation="1.8" result="liquid-softness">
+        <animate attributeName="stdDeviation" values="1.8;2.8;1.7;0.2" keyTimes="0;0.22;0.55;1" dur="1.55s" fill="freeze" />
+      </feGaussianBlur>
+    </filter>
+  `
+  document.body.append(svg)
+}
+
+const flipTransitionImage = new Image()
+flipTransitionImage.decoding = 'async'
+flipTransitionImage.src = patchworkAtlasUrl
+void flipTransitionImage.decode().catch(() => undefined)
+
+function paintFlipGridPreview(canvas: HTMLCanvasElement, image: HTMLImageElement): void {
+  const tileTarget = innerWidth <= 640 ? 48 : 66
+  const columns = Math.max(3, Math.round(innerWidth / tileTarget))
+  const tileSize = innerWidth / columns
+  const rows = Math.ceil(innerHeight / tileSize)
+  const scale = Math.min(devicePixelRatio || 1, 1.25)
+  const context = canvas.getContext('2d')!
+  const sourceWidth = image.naturalWidth / 4
+  const sourceHeight = image.naturalHeight / 4
+
+  canvas.width = Math.max(1, Math.round(innerWidth * scale))
+  canvas.height = Math.max(1, Math.round(innerHeight * scale))
+  context.setTransform(scale, 0, 0, scale, 0, 0)
+  context.imageSmoothingEnabled = true
+
+  for (let index = 0; index < columns * rows; index += 1) {
+    const artIndex = (index * 7 + Math.floor(index / 16) * 3) % 16
+    const artColumn = artIndex % 4
+    const artRow = Math.floor(artIndex / 4)
+    const column = index % columns
+    const row = Math.floor(index / columns)
+    const x = column * tileSize
+    const y = row * tileSize
+    context.drawImage(
+      image,
+      artColumn * sourceWidth,
+      artRow * sourceHeight,
+      sourceWidth,
+      sourceHeight,
+      x,
+      y,
+      tileSize,
+      tileSize,
+    )
+    context.strokeStyle = 'rgba(255,255,255,.34)'
+    context.lineWidth = 1
+    context.strokeRect(x + .5, y + .5, tileSize - 1, tileSize - 1)
+  }
+}
+
+function buildFlipGridTransition(container: HTMLDivElement, imageUrl: string): void {
+  container.classList.add('is-flip-grid-transition')
+  const canvas = document.createElement('canvas')
+  canvas.setAttribute('aria-hidden', 'true')
+  if (flipTransitionImage.complete && flipTransitionImage.naturalWidth) {
+    paintFlipGridPreview(canvas, flipTransitionImage)
+  } else {
+    container.style.backgroundImage = `url(${imageUrl})`
+    container.style.backgroundSize = 'cover'
+  }
+  container.append(canvas)
+}
+
 function triggerSelectedWork(target: WorkState | null = centerLockedState): void {
   if (!target || fistLocked) return
   fistLocked = true
+  const orbRect = target.orb.getBoundingClientRect()
   target.element.classList.add('is-bursting')
   const selectedWork = target
+
+  if (selectedWork.exampleUrl) {
+    const destination = `${import.meta.env.BASE_URL}${selectedWork.exampleUrl}`
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    pageTransitioning = true
+    trackingMode = 'mouse'
+    handActive = false
+    cameraStream?.getTracks().forEach((track) => track.stop())
+    cameraStream = null
+
+    if (reducedMotion) {
+      document.documentElement.classList.add('is-leaving-page')
+      window.setTimeout(() => window.location.assign(destination), 180)
+      return
+    }
+
+    const originX = orbRect.left + orbRect.width / 2
+    const originY = orbRect.top + orbRect.height / 2
+    const farthestX = Math.max(originX, innerWidth - originX)
+    const farthestY = Math.max(originY, innerHeight - originY)
+    const coverRadius = Math.hypot(farthestX, farthestY) + 24
+    const orbStyle = getComputedStyle(selectedWork.orb)
+    const transitionLayer = document.createElement('div')
+    const transitionArt = document.createElement('div')
+    const rippleLayer = document.createElement('div')
+
+    ensureLiquidTransitionFilter()
+    transitionLayer.className = 'orb-page-transition'
+    transitionLayer.setAttribute('aria-hidden', 'true')
+    transitionLayer.style.setProperty('--transition-x', `${originX}px`)
+    transitionLayer.style.setProperty('--transition-y', `${originY}px`)
+    transitionLayer.style.setProperty('--transition-start-radius', `${Math.max(orbRect.width / 2, 1)}px`)
+    transitionLayer.style.setProperty('--transition-end-radius', `${coverRadius}px`)
+    transitionArt.className = 'orb-page-transition-art'
+    if (selectedWork.transitionLayout === 'flip-grid' && selectedWork.previewUrl) {
+      transitionLayer.classList.add('is-lightweight-transition')
+      transitionLayer.style.setProperty('--transition-start-radius', '2px')
+      buildFlipGridTransition(transitionArt, selectedWork.previewUrl)
+    } else {
+      transitionArt.style.backgroundColor = orbStyle.backgroundColor
+      transitionArt.style.backgroundImage = orbStyle.backgroundImage
+      transitionArt.style.backgroundPosition = orbStyle.backgroundPosition
+      transitionArt.style.backgroundSize = orbStyle.backgroundSize
+      transitionArt.style.backgroundRepeat = orbStyle.backgroundRepeat
+      transitionArt.style.imageRendering = orbStyle.imageRendering
+      transitionArt.style.filter = orbStyle.filter
+    }
+    transitionLayer.append(transitionArt)
+    rippleLayer.className = 'orb-water-ripples'
+    rippleLayer.setAttribute('aria-hidden', 'true')
+    rippleLayer.style.setProperty('--ripple-x', `${originX}px`)
+    rippleLayer.style.setProperty('--ripple-y', `${originY}px`)
+    rippleLayer.style.setProperty('--ripple-size', `${Math.max(orbRect.width, 1)}px`)
+    rippleLayer.innerHTML = '<span></span><span></span><span></span>'
+    document.body.append(transitionLayer)
+    document.body.append(rippleLayer)
+    document.documentElement.classList.add('is-page-transitioning')
+
+    window.setTimeout(() => {
+      transitionLayer.classList.add('is-expanding')
+    }, 220)
+    window.setTimeout(() => window.location.assign(destination), 1640)
+    return
+  }
+
   window.setTimeout(() => {
     selectedWork.element.classList.remove('is-bursting')
     openWork(selectedWork)
@@ -324,54 +498,138 @@ function updateHandCursor(landmarks: Point[]): void {
   }
 }
 
+function getHandLandmarker(): Promise<HandLandmarker> {
+  if (!handLandmarkerPromise) {
+    handLandmarkerPromise = FilesetResolver.forVisionTasks(trackingAssetBase)
+      .then((vision) => HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: `${trackingAssetBase}/hand_landmarker.task`,
+          delegate: 'GPU',
+        },
+        runningMode: 'VIDEO',
+        numHands: 1,
+        minHandDetectionConfidence: 0.55,
+        minHandPresenceConfidence: 0.55,
+        minTrackingConfidence: 0.55,
+      }))
+      .catch((error) => {
+        handLandmarkerPromise = null
+        throw error
+      })
+  }
+  return handLandmarkerPromise
+}
+
+function warmHandTrackingModel(): void {
+  void getHandLandmarker().catch((error) => {
+    // A button click will retry initialization. Keep the warm-up failure quiet
+    // because some browsers delay GPU setup until the page is interacted with.
+    console.warn('Hand tracking warm-up was deferred.', error)
+  })
+}
+
 async function startHandTracking(): Promise<void> {
   const button = document.querySelector<HTMLButtonElement>('#handModeButton')!
+  const mouseButton = document.querySelector<HTMLButtonElement>('#mouseModeButton')!
   const status = document.querySelector<HTMLDivElement>('#trackingStatus')!
   const video = document.querySelector<HTMLVideoElement>('#cameraPreview')!
+  trackingMode = 'hand'
+  handActive = false
+  mouseButton.classList.remove('is-active')
+  mouseButton.setAttribute('aria-pressed', 'false')
+  button.classList.add('is-active')
+  button.setAttribute('aria-pressed', 'true')
   button.disabled = true
-  button.textContent = '핸드트레킹 준비 중…'
+  button.textContent = 'Hand Tracking Mode…'
+  status.textContent = 'Hand Tracking Mode'
   try {
-    cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 1280, height: 720 }, audio: false })
+    // Request the camera and prepare the model at the same time so model
+    // loading does not hold up camera startup.
+    const cameraPromise = navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: 'user',
+        width: { ideal: 960 },
+        height: { ideal: 540 },
+        frameRate: { ideal: 30, max: 30 },
+      },
+      audio: false,
+    })
+    const modelPromise = getHandLandmarker()
+    cameraStream = await cameraPromise
     video.srcObject = cameraStream
     await video.play()
-    const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm')
-    handLandmarker = await HandLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
-        delegate: 'GPU',
-      },
-      runningMode: 'VIDEO',
-      numHands: 1,
-      minHandDetectionConfidence: 0.55,
-      minHandPresenceConfidence: 0.55,
-      minTrackingConfidence: 0.55,
-    })
+    video.classList.add('is-active')
+    status.textContent = 'Camera on · preparing hand tracking…'
+    handLandmarker = await modelPromise
+    if (trackingMode !== 'hand') {
+      cameraStream?.getTracks().forEach((track) => track.stop())
+      return
+    }
     handActive = true
-    button.textContent = '핸드트레킹 모드 켜짐'
+    button.textContent = 'Hand Tracking Mode'
     status.textContent = 'Index finger = cursor · open hand → fist to select'
     detectHands(video)
   } catch (error) {
     console.error(error)
     button.disabled = false
-    button.textContent = '핸드트레킹 모드'
+    button.textContent = 'Hand Tracking Mode'
+    button.classList.remove('is-active')
+    button.setAttribute('aria-pressed', 'false')
+    trackingMode = 'mouse'
     status.textContent = 'Camera access was not available'
     cameraStream?.getTracks().forEach((track) => track.stop())
+    video.classList.remove('is-active')
   }
 }
 
+function activateMouseMode(): void {
+  trackingMode = 'mouse'
+  handActive = false
+  handWasOpen = false
+  fistLocked = false
+  cameraStream?.getTracks().forEach((track) => track.stop())
+  cameraStream = null
+  handLandmarker = null
+  lastHandDetectionAt = 0
+  lastDetectedVideoTime = -1
+  const video = document.querySelector<HTMLVideoElement>('#cameraPreview')!
+  video.srcObject = null
+  video.classList.remove('is-active')
+  document.querySelector<HTMLElement>('#handCursor')!.classList.remove('is-visible')
+  const mouseButton = document.querySelector<HTMLButtonElement>('#mouseModeButton')!
+  const handButton = document.querySelector<HTMLButtonElement>('#handModeButton')!
+  mouseButton.classList.add('is-active')
+  mouseButton.setAttribute('aria-pressed', 'true')
+  handButton.classList.remove('is-active')
+  handButton.setAttribute('aria-pressed', 'false')
+  handButton.disabled = false
+  handButton.textContent = 'Hand Tracking Mode'
+}
+
 function detectHands(video: HTMLVideoElement): void {
-  if (!handLandmarker) return
-  const result = handLandmarker.detectForVideo(video, performance.now())
-  if (result.landmarks[0]) updateHandCursor(result.landmarks[0])
-  else {
-    handActive = false
-    selectedState = null
-    document.querySelector<HTMLElement>('#handCursor')!.classList.remove('is-visible')
+  if (trackingMode !== 'hand' || !handLandmarker) return
+  const now = performance.now()
+  if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+    && video.currentTime !== lastDetectedVideoTime
+    && now - lastHandDetectionAt >= 33) {
+    lastHandDetectionAt = now
+    lastDetectedVideoTime = video.currentTime
+    const result = handLandmarker.detectForVideo(video, now)
+    if (result.landmarks[0]) updateHandCursor(result.landmarks[0])
+    else {
+      handActive = false
+      selectedState = null
+      document.querySelector<HTMLElement>('#handCursor')!.classList.remove('is-visible')
+    }
   }
   requestAnimationFrame(() => detectHands(video))
 }
 
+document.querySelector<HTMLButtonElement>('#mouseModeButton')!.addEventListener('click', activateMouseMode)
 document.querySelector<HTMLButtonElement>('#handModeButton')!.addEventListener('click', startHandTracking)
+
+if (document.readyState === 'complete') window.setTimeout(warmHandTrackingModel, 250)
+else window.addEventListener('load', () => window.setTimeout(warmHandTrackingModel, 250), { once: true })
 
 const movementPrompts = [
   'Move. Observe. Discover.',

@@ -16,4 +16,9 @@ export default defineConfig({
     port: 5173,
   },
   base: isGitHubPagesBuild ? `/${repositoryName}/` : '/',
+  build: {
+    rollupOptions: {
+      input: ['index.html', 'examples/watering.html', 'examples/kitty-flip.html', 'examples/words-in-motion.html'],
+    },
+  },
 })
